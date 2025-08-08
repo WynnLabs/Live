@@ -1,92 +1,146 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.27;
+pragma solidity ^0.8.30;
 
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
-contract LuckyLoop is Ownable, ReentrancyGuard {
-    using SafeMath for uint256;
+contract LuckyLoop is ReentrancyGuard, Ownable {
+    // ===== IMMUTABLE CONFIG =====
+    address public immutable prizePoolWallet = 0x3F449799411d3a2Bc8E232d48282422B4344fe6D;
+    address public immutable profitWallet = 0x31Bd345293BB862A913935551ce0a0101efE5194;
 
-    uint256 public constant MAX_ENTRIES = 100;
-    uint256 public constant ENTRY_FEE = 0.01 ether;
-    uint256 public constant PROFIT_PERCENT = 50;
+    // ===== TIER PARAMETERS =====
+    uint256 public constant TIER1_ENTRY_FEE = 0.00125 ether;
+    uint256 public constant TIER1_PRIZE_AMOUNT = 0.025 ether;
+    uint256 public constant TIER1_PROFIT_AMOUNT = 0.0125 ether;
+    uint256 public constant TIER1_MAX_PARTICIPANTS = 100;
 
-    address public immutable prizePoolWallet = 0xdcbA84e0a9694C450aD9c385cf81C8bAc7C37Cc1;
-    address public immutable profitWallet = 0x31Bd345293BB862A91393551ce0a0101efE5194;
-    uint256 public currentRound;
-    uint256 public entryCount;
-    address[] public entries;
-    address public winner;
-    bool public roundActive;
+    uint256 public constant TIER2_ENTRY_FEE = 0.0125 ether;
+    uint256 public constant TIER2_PRIZE_AMOUNT = 0.25 ether;
+    uint256 public constant TIER2_PROFIT_AMOUNT = 0.125 ether;
+    uint256 public constant TIER2_MAX_PARTICIPANTS = 100;
 
-    event EntryReceived(address indexed player, uint256 round, uint256 timestamp);
-    event WinnerSelected(address indexed winner, uint256 round, uint256 prize, uint256 timestamp);
-    event PrizeDistributed(address indexed winner, uint256 amount, uint256 timestamp);
-    event RoundStarted(uint256 round, uint256 timestamp);
-    event RoundEnded(uint256 round, uint256 timestamp);
-    event FundsSplit(uint256 prizeAmount, uint256 profitAmount, uint256 timestamp);
+    // ===== STATE =====
+    mapping(uint256 => address[]) public tierParticipants;
+    mapping(uint256 => mapping(address => bool)) public hasEntered;
+    mapping(uint256 => bool) public isTierActive;
 
-    constructor() Ownable(msg.sender) {
-        currentRound = 1;
-        roundActive = true;
-        emit RoundStarted(currentRound, block.timestamp);
+    // ===== EVENTS =====
+    event Entered(uint256 indexed tier, address indexed participant);
+    event WinnerSelected(uint256 indexed tier, address indexed winner, uint256 prizeAmount);
+    event FundsDistributed(uint256 prizeAmount, uint256 profitAmount);
+    event TierActivated(uint256 indexed tier, bool active);
+
+    constructor() {
+        // default owner is msg.sender (Ownable). If you want the owner to be the profitWallet,
+        // transfer ownership immediately:
+        _transferOwnership(profitWallet);
+
+        isTierActive[1] = true;
+        isTierActive[2] = true;
     }
 
-    function enter() external payable nonReentrant {
-        require(roundActive, "Round not active");
-        require(msg.value == ENTRY_FEE, "Incorrect entry fee");
-        require(entryCount < MAX_ENTRIES, "Round full");
-        require(entries.length == 0 || entries[entries.length - 1] != msg.sender, "Already entered");
+    // ===== CORE FUNCTIONS =====
+    function enterLottery(uint256 tier) external payable nonReentrant {
+        require(tier == 1 || tier == 2, "Invalid tier");
+        require(isTierActive[tier], "Tier inactive");
+        require(!hasEntered[tier][msg.sender], "Already entered");
 
-        entries.push(msg.sender);
-        entryCount = entryCount.add(1);
-        emit EntryReceived(msg.sender, currentRound, block.timestamp);
+        if (tier == 1) {
+            require(msg.value == TIER1_ENTRY_FEE, "Tier 1: incorrect fee");
+            require(tierParticipants[1].length < TIER1_MAX_PARTICIPANTS, "Tier 1 full");
+        } else {
+            require(msg.value == TIER2_ENTRY_FEE, "Tier 2: incorrect fee");
+            require(tierParticipants[2].length < TIER2_MAX_PARTICIPANTS, "Tier 2 full");
+        }
 
-        uint256 prizeAmount = msg.value.mul(100 - PROFIT_PERCENT).div(100);
-        uint256 profitAmount = msg.value.sub(prizeAmount);
-        (bool sentPrize, ) = prizePoolWallet.call{value: prizeAmount}("");
-        (bool sentProfit, ) = profitWallet.call{value: profitAmount}("");
-        require(sentPrize && sentProfit, "Fund split failed");
-        emit FundsSplit(prizeAmount, profitAmount, block.timestamp);
+        tierParticipants[tier].push(msg.sender);
+        hasEntered[tier][msg.sender] = true;
 
-        if (entryCount == MAX_ENTRIES) {
-            roundActive = false;
-            emit RoundEnded(currentRound, block.timestamp);
-            selectWinner();
+        emit Entered(tier, msg.sender);
+
+        // If the tier reached max participants, draw a winner
+        if (tierParticipants[tier].length == (tier == 1 ? TIER1_MAX_PARTICIPANTS : TIER2_MAX_PARTICIPANTS)) {
+            _drawWinner(tier);
         }
     }
 
-    function selectWinner() private {
-        uint256 seed = uint256(keccak256(abi.encodePacked(
-            block.prevrandao,
-            block.timestamp,
+    // ===== INTERNAL =====
+    function _drawWinner(uint256 tier) internal {
+        require(tier == 1 || tier == 2, "Invalid tier");
+        uint256 participantCount = tierParticipants[tier].length;
+        require(participantCount > 0, "No participants");
+
+        uint256 prizeAmount = tier == 1 ? TIER1_PRIZE_AMOUNT : TIER2_PRIZE_AMOUNT;
+        uint256 profitAmount = tier == 1 ? TIER1_PROFIT_AMOUNT : TIER2_PROFIT_AMOUNT;
+        uint256 totalRequired = prizeAmount + profitAmount;
+
+        // Safety: ensure contract has enough balance to pay out
+        require(address(this).balance >= totalRequired, "Insufficient contract balance for payout");
+
+        uint256 index = _randomIndex(tier) % participantCount;
+        address winner = tierParticipants[tier][index];
+
+        // Reset per-round entries before transfers to avoid reentrancy edgecases with state (we still use nonReentrant)
+        // Clear hasEntered for all participants
+        for (uint256 i = 0; i < participantCount; i++) {
+            address participant = tierParticipants[tier][i];
+            hasEntered[tier][participant] = false;
+        }
+        // Clear participants array
+        delete tierParticipants[tier];
+
+        // Pay prize to winner
+        (bool sentPrize, ) = winner.call{value: prizeAmount}("");
+        require(sentPrize, "Prize transfer failed");
+
+        // Pay profit to profit wallet
+        (bool sentProfit, ) = profitWallet.call{value: profitAmount}("");
+        require(sentProfit, "Profit transfer failed");
+
+        emit WinnerSelected(tier, winner, prizeAmount);
+        emit FundsDistributed(prizeAmount, profitAmount);
+    }
+
+    /// @dev A simple pseudo-randomness function. NOT secure for high-value/attacked games.
+    ///      For production use, integrate a VRF (Chainlink VRF or similar).
+    function _randomIndex(uint256 tier) internal view returns (uint256) {
+        // Use a combination of recent block data, contract address, tier and participant count to make the seed harder to predict.
+        uint256 partLen = tierParticipants[tier].length;
+        return uint256(keccak256(abi.encodePacked(
             blockhash(block.number - 1),
-            currentRound,
-            entries.length
+            block.timestamp,
+            block.difficulty,
+            address(this),
+            tier,
+            partLen
         )));
-        uint256 index = seed % MAX_ENTRIES;
-        winner = entries[index];
-        uint256 prize = prizePoolWallet.balance;
-        (bool sent, ) = winner.call{value: prize}("");
-        require(sent, "Prize distribution failed");
-        emit WinnerSelected(winner, currentRound, prize, block.timestamp);
-        emit PrizeDistributed(winner, prize, block.timestamp);
-
-        resetRound();
     }
 
-    function resetRound() private {
-        currentRound = currentRound.add(1);
-        entryCount = 0;
-        delete entries;
-        roundActive = true;
-        emit RoundStarted(currentRound, block.timestamp);
+    // ===== VIEW FUNCTIONS =====
+    function getParticipantCount(uint256 tier) external view returns (uint256) {
+        require(tier == 1 || tier == 2, "Invalid tier");
+        return tierParticipants[tier].length;
     }
 
-    function getEntries() external view returns (address[] memory) {
-        return entries;
+    function checkEntry(uint256 tier, address participant) external view returns (bool) {
+        require(tier == 1 || tier == 2, "Invalid tier");
+        return hasEntered[tier][participant];
     }
 
+    // ===== ADMIN =====
+    /// @notice Owner can withdraw any stuck funds (emergency).
+    function emergencyWithdraw() external onlyOwner {
+        payable(owner()).transfer(address(this).balance);
+    }
+
+    /// @notice Activate or deactivate a tier
+    function setTierActive(uint256 tier, bool active) external onlyOwner {
+        require(tier == 1 || tier == 2, "Invalid tier");
+        isTierActive[tier] = active;
+        emit TierActivated(tier, active);
+    }
+
+    // Receive function to accept ETH (entry fees)
     receive() external payable {}
 }
